@@ -1,0 +1,31 @@
+[package]
+name = "tunnelAI"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+bytes = "1.12.0"
+clap = { version = "4.6.1", features = ["derive"] }
+futures-util = "0.3.32"
+iroh = "1.0.0"
+iroh-tickets = "1.0.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["full"] }
+
+[lib]
+name = "tunnel_ai"
+
+[[bin]]
+name = "tunnelAI"
+path = "src/main.rs"
