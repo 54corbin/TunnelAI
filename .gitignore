@@ -1,2 +1,4 @@
 /target
 /dist
+openai-server.key
+.hermes/

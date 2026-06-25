@@ -1,11 +1,13 @@
 use crate::cli::ClientArgs;
 use crate::iroh_endpoint::{parse_server_ticket, start_client_endpoint};
 use crate::route_logging::{log_connection_route, spawn_path_event_logger};
-use crate::socks5::{ReplyCode, negotiate_no_auth, read_connect_request, write_reply};
+use crate::socks5::{
+    ConnectRequest, ReplyCode, negotiate_no_auth, read_connect_request, write_reply,
+};
 use crate::tunnel::{read_response, write_request};
 use anyhow::{Context, Result};
 use iroh::Endpoint;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, copy};
@@ -159,67 +161,31 @@ pub async fn handle_socks_connection(
     tunnel_operation_timeout: Duration,
     socks_peer: Option<SocketAddr>,
 ) -> Result<()> {
-    match timeout(socks_handshake_timeout, negotiate_no_auth(&mut local)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            error!(?err, "SOCKS method negotiation failed");
-            return Err(err.into());
-        }
-        Err(_) => {
-            debug!("SOCKS method negotiation timed out");
-            return Ok(());
-        }
+    if !perform_socks_handshake(&mut local, socks_handshake_timeout).await? {
+        return Ok(());
     }
 
-    let request = match timeout(socks_handshake_timeout, read_connect_request(&mut local)).await {
-        Ok(Ok(request)) => request,
-        Ok(Err(err)) => {
-            let _ = write_reply(&mut local, err.reply_code()).await;
-            return Err(err.into());
-        }
-        Err(_) => {
-            debug!("SOCKS CONNECT request timed out");
-            return Ok(());
-        }
+    let Some(request) = read_socks_connect_request(&mut local, socks_handshake_timeout).await?
+    else {
+        return Ok(());
     };
     let target = request.target_display();
     info!(target = %target, "tunnel opened");
     log_connection_route("client", &connection, socks_peer, Some(&target));
 
-    let (mut send, mut recv) = match timeout(tunnel_operation_timeout, connection.open_bi()).await {
-        Ok(Ok(streams)) => streams,
-        Ok(Err(err)) => {
-            let _ = write_reply(&mut local, ReplyCode::GeneralFailure).await;
-            return Err(err.into());
-        }
-        Err(_) => {
-            let _ = write_reply(&mut local, ReplyCode::TtlExpired).await;
-            return Ok(());
-        }
+    let Some((mut send, mut recv)) =
+        open_tunnel_stream(&mut local, &connection, tunnel_operation_timeout).await?
+    else {
+        return Ok(());
     };
 
-    match timeout(tunnel_operation_timeout, write_request(&mut send, &request)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            let _ = write_reply(&mut local, ReplyCode::GeneralFailure).await;
-            return Err(err.into());
-        }
-        Err(_) => {
-            let _ = write_reply(&mut local, ReplyCode::TtlExpired).await;
-            return Ok(());
-        }
+    if !send_tunnel_request(&mut local, &mut send, &request, tunnel_operation_timeout).await? {
+        return Ok(());
     }
 
-    let status = match timeout(tunnel_operation_timeout, read_response(&mut recv)).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(err)) => {
-            let _ = write_reply(&mut local, ReplyCode::GeneralFailure).await;
-            return Err(err.into());
-        }
-        Err(_) => {
-            let _ = write_reply(&mut local, ReplyCode::TtlExpired).await;
-            return Ok(());
-        }
+    let Some(status) = read_tunnel_status(&mut local, &mut recv, tunnel_operation_timeout).await?
+    else {
+        return Ok(());
     };
 
     write_reply(&mut local, status).await?;
@@ -228,6 +194,104 @@ pub async fn handle_socks_connection(
         return Ok(());
     }
 
+    relay_socks_tunnel(local, send, recv).await
+}
+
+async fn perform_socks_handshake(
+    local: &mut TcpStream,
+    handshake_timeout: Duration,
+) -> Result<bool> {
+    match timeout(handshake_timeout, negotiate_no_auth(local)).await {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(err)) => {
+            error!(?err, "SOCKS method negotiation failed");
+            Err(err.into())
+        }
+        Err(_) => {
+            debug!("SOCKS method negotiation timed out");
+            Ok(false)
+        }
+    }
+}
+
+async fn read_socks_connect_request(
+    local: &mut TcpStream,
+    handshake_timeout: Duration,
+) -> Result<Option<ConnectRequest>> {
+    match timeout(handshake_timeout, read_connect_request(local)).await {
+        Ok(Ok(request)) => Ok(Some(request)),
+        Ok(Err(err)) => {
+            let _ = write_reply(local, err.reply_code()).await;
+            Err(err.into())
+        }
+        Err(_) => {
+            debug!("SOCKS CONNECT request timed out");
+            Ok(None)
+        }
+    }
+}
+
+async fn open_tunnel_stream(
+    local: &mut TcpStream,
+    connection: &Connection,
+    tunnel_operation_timeout: Duration,
+) -> Result<Option<(SendStream, RecvStream)>> {
+    match timeout(tunnel_operation_timeout, connection.open_bi()).await {
+        Ok(Ok(streams)) => Ok(Some(streams)),
+        Ok(Err(err)) => {
+            let _ = write_reply(local, ReplyCode::GeneralFailure).await;
+            Err(err.into())
+        }
+        Err(_) => {
+            let _ = write_reply(local, ReplyCode::TtlExpired).await;
+            Ok(None)
+        }
+    }
+}
+
+async fn send_tunnel_request(
+    local: &mut TcpStream,
+    send: &mut SendStream,
+    request: &ConnectRequest,
+    tunnel_operation_timeout: Duration,
+) -> Result<bool> {
+    match timeout(tunnel_operation_timeout, write_request(send, request)).await {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(err)) => {
+            let _ = write_reply(local, ReplyCode::GeneralFailure).await;
+            Err(err.into())
+        }
+        Err(_) => {
+            let _ = send.finish();
+            let _ = write_reply(local, ReplyCode::TtlExpired).await;
+            Ok(false)
+        }
+    }
+}
+
+async fn read_tunnel_status(
+    local: &mut TcpStream,
+    recv: &mut RecvStream,
+    tunnel_operation_timeout: Duration,
+) -> Result<Option<ReplyCode>> {
+    match timeout(tunnel_operation_timeout, read_response(recv)).await {
+        Ok(Ok(status)) => Ok(Some(status)),
+        Ok(Err(err)) => {
+            let _ = write_reply(local, ReplyCode::GeneralFailure).await;
+            Err(err.into())
+        }
+        Err(_) => {
+            let _ = write_reply(local, ReplyCode::TtlExpired).await;
+            Ok(None)
+        }
+    }
+}
+
+async fn relay_socks_tunnel(
+    local: TcpStream,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> Result<()> {
     let (mut local_read, mut local_write) = local.into_split();
     let local_to_iroh = async {
         let copied = copy(&mut local_read, &mut send).await?;

@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use tokio::io::{AsyncWriteExt, copy};
 use tokio::net::{TcpStream, lookup_host};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, error, info, warn};
@@ -135,30 +135,44 @@ fn spawn_accept_loop(endpoint: Endpoint, config: ServerConfig) -> JoinHandle<()>
 async fn handle_connection(connection: Connection, config: ServerConfig) -> Result<()> {
     let stream_limit = std::sync::Arc::new(Semaphore::new(config.max_streams_per_connection));
     loop {
-        match connection.accept_bi().await {
-            Ok((mut send, recv)) => {
-                let permit = match stream_limit.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        debug!("rejecting tunnel stream over concurrency limit");
-                        let _ = write_response(&mut send, ReplyCode::GeneralFailure).await;
-                        let _ = send.finish();
-                        drop(recv);
-                        continue;
-                    }
-                };
-                let config = config.clone();
-                let connection = connection.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(err) = handle_tunnel_stream(send, recv, config, connection).await {
-                        debug!(?err, "tunnel stream ended with error");
-                    }
-                });
-            }
-            Err(err) => return Err(err.into()),
+        let (mut send, recv) = connection.accept_bi().await?;
+        let Some(permit) = acquire_tunnel_stream_permit(stream_limit.clone(), &mut send).await?
+        else {
+            drop(recv);
+            continue;
+        };
+        spawn_tunnel_stream_handler(send, recv, config.clone(), connection.clone(), permit);
+    }
+}
+
+async fn acquire_tunnel_stream_permit(
+    stream_limit: std::sync::Arc<Semaphore>,
+    send: &mut SendStream,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    match stream_limit.try_acquire_owned() {
+        Ok(permit) => Ok(Some(permit)),
+        Err(_) => {
+            debug!("rejecting tunnel stream over concurrency limit");
+            let _ = write_response(send, ReplyCode::GeneralFailure).await;
+            let _ = send.finish();
+            Ok(None)
         }
     }
+}
+
+fn spawn_tunnel_stream_handler(
+    send: SendStream,
+    recv: RecvStream,
+    config: ServerConfig,
+    connection: Connection,
+    permit: OwnedSemaphorePermit,
+) {
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(err) = handle_tunnel_stream(send, recv, config, connection).await {
+            debug!(?err, "tunnel stream ended with error");
+        }
+    });
 }
 
 pub async fn handle_tunnel_stream(
@@ -167,59 +181,94 @@ pub async fn handle_tunnel_stream(
     config: ServerConfig,
     connection: Connection,
 ) -> Result<()> {
-    let request = match timeout(config.tunnel_request_timeout, read_request(&mut recv)).await {
-        Ok(Ok(request)) => request,
-        Ok(Err(err)) => return Err(err).context("read tunnel request"),
-        Err(_) => {
-            debug!("timed out waiting for tunnel request");
-            send.finish()?;
-            return Ok(());
-        }
+    let Some(request) =
+        read_tunnel_request(&mut send, &mut recv, config.tunnel_request_timeout).await?
+    else {
+        return Ok(());
     };
     debug!(target = %request.target_display(), "received tunnel request");
     let target_display = request.target_display();
     log_connection_route("server", &connection, None, Some(&target_display));
 
-    if !target_allowed(&request, config.allow_private_targets) {
-        write_response(&mut send, ReplyCode::ConnectionNotAllowed).await?;
-        send.finish()?;
+    let Some(target) = resolve_allowed_target(&mut send, &request, &config).await? else {
         return Ok(());
-    }
-
-    let target = match timeout(
-        config.target_connect_timeout,
-        resolve_target(&request, &config),
-    )
-    .await
-    {
-        Ok(Ok(target)) => target,
-        Ok(Err(code)) => {
-            write_response(&mut send, code).await?;
-            send.finish()?;
-            return Ok(());
-        }
-        Err(_) => {
-            write_response(&mut send, ReplyCode::TtlExpired).await?;
-            send.finish()?;
-            return Ok(());
-        }
     };
-    let tcp = match timeout(config.target_connect_timeout, TcpStream::connect(target)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(err)) => {
-            let code = map_connect_error(&err);
-            write_response(&mut send, code).await?;
-            send.finish()?;
-            return Ok(());
-        }
-        Err(_) => {
-            write_response(&mut send, ReplyCode::TtlExpired).await?;
-            send.finish()?;
-            return Ok(());
-        }
+
+    let Some(tcp) = connect_target(&mut send, target, config.target_connect_timeout).await? else {
+        return Ok(());
     };
 
     write_response(&mut send, ReplyCode::Succeeded).await?;
+    relay_tunnel_to_tcp(send, recv, tcp).await
+}
+
+async fn read_tunnel_request(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    tunnel_request_timeout: Duration,
+) -> Result<Option<ConnectRequest>> {
+    match timeout(tunnel_request_timeout, read_request(recv)).await {
+        Ok(Ok(request)) => Ok(Some(request)),
+        Ok(Err(err)) => Err(err).context("read tunnel request"),
+        Err(_) => {
+            debug!("timed out waiting for tunnel request");
+            send.finish()?;
+            Ok(None)
+        }
+    }
+}
+
+async fn resolve_allowed_target(
+    send: &mut SendStream,
+    request: &ConnectRequest,
+    config: &ServerConfig,
+) -> Result<Option<SocketAddr>> {
+    if !target_allowed(request, config.allow_private_targets) {
+        write_response_and_finish(send, ReplyCode::ConnectionNotAllowed).await?;
+        return Ok(None);
+    }
+
+    match timeout(
+        config.target_connect_timeout,
+        resolve_target(request, config),
+    )
+    .await
+    {
+        Ok(Ok(target)) => Ok(Some(target)),
+        Ok(Err(code)) => {
+            write_response_and_finish(send, code).await?;
+            Ok(None)
+        }
+        Err(_) => {
+            write_response_and_finish(send, ReplyCode::TtlExpired).await?;
+            Ok(None)
+        }
+    }
+}
+
+async fn connect_target(
+    send: &mut SendStream,
+    target: SocketAddr,
+    target_connect_timeout: Duration,
+) -> Result<Option<TcpStream>> {
+    match timeout(target_connect_timeout, TcpStream::connect(target)).await {
+        Ok(Ok(stream)) => Ok(Some(stream)),
+        Ok(Err(err)) => {
+            write_response_and_finish(send, map_connect_error(&err)).await?;
+            Ok(None)
+        }
+        Err(_) => {
+            write_response_and_finish(send, ReplyCode::TtlExpired).await?;
+            Ok(None)
+        }
+    }
+}
+
+async fn relay_tunnel_to_tcp(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    tcp: TcpStream,
+) -> Result<()> {
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
 
     let client_to_target = async {
@@ -237,36 +286,62 @@ pub async fn handle_tunnel_stream(
     Ok(())
 }
 
+async fn write_response_and_finish(send: &mut SendStream, code: ReplyCode) -> Result<()> {
+    write_response(send, code).await?;
+    send.finish()?;
+    Ok(())
+}
+
 async fn resolve_target(
     request: &ConnectRequest,
     config: &ServerConfig,
 ) -> Result<SocketAddr, ReplyCode> {
     match &request.target {
-        TargetAddr::Ip(ip) => {
-            let addr = SocketAddr::new(*ip, request.port);
-            if target_ip_allowed(*ip, config.allow_private_targets) {
-                Ok(addr)
-            } else {
-                Err(ReplyCode::ConnectionNotAllowed)
-            }
-        }
+        TargetAddr::Ip(ip) => resolve_ip_target(*ip, request.port, config.allow_private_targets),
         TargetAddr::Domain(domain) => {
-            let mut saw_denied = false;
-            let addrs = lookup_host((domain.as_str(), request.port))
-                .await
-                .map_err(|_| ReplyCode::HostUnreachable)?;
-            for addr in addrs {
-                if target_ip_allowed(addr.ip(), config.allow_private_targets) {
-                    return Ok(addr);
-                }
-                saw_denied = true;
-            }
-            if saw_denied {
-                Err(ReplyCode::ConnectionNotAllowed)
-            } else {
-                Err(ReplyCode::HostUnreachable)
-            }
+            resolve_domain_target(domain, request.port, config.allow_private_targets).await
         }
+    }
+}
+
+fn resolve_ip_target(
+    ip: IpAddr,
+    port: u16,
+    allow_private_targets: bool,
+) -> Result<SocketAddr, ReplyCode> {
+    if target_ip_allowed(ip, allow_private_targets) {
+        Ok(SocketAddr::new(ip, port))
+    } else {
+        Err(ReplyCode::ConnectionNotAllowed)
+    }
+}
+
+async fn resolve_domain_target(
+    domain: &str,
+    port: u16,
+    allow_private_targets: bool,
+) -> Result<SocketAddr, ReplyCode> {
+    let addrs = lookup_host((domain, port))
+        .await
+        .map_err(|_| ReplyCode::HostUnreachable)?;
+    select_allowed_resolved_addr(addrs, allow_private_targets)
+}
+
+fn select_allowed_resolved_addr(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    allow_private_targets: bool,
+) -> Result<SocketAddr, ReplyCode> {
+    let mut saw_denied = false;
+    for addr in addrs {
+        if target_ip_allowed(addr.ip(), allow_private_targets) {
+            return Ok(addr);
+        }
+        saw_denied = true;
+    }
+    if saw_denied {
+        Err(ReplyCode::ConnectionNotAllowed)
+    } else {
+        Err(ReplyCode::HostUnreachable)
     }
 }
 

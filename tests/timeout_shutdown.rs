@@ -1,11 +1,13 @@
+mod common;
+
+use common::{
+    endpoint_ticket_string, parse_server_ticket, start_client_endpoint, start_server_endpoint,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, sleep, timeout};
 use tunnel_ai::client::{
     ClientConfig, start_client_for_test_with_config, start_client_for_test_with_handshake_timeout,
-};
-use tunnel_ai::iroh_endpoint::{
-    endpoint_ticket_string, parse_server_ticket, start_client_endpoint, start_server_endpoint,
 };
 use tunnel_ai::server::{
     ServerConfig, start_server_for_test, start_server_for_test_with_config,
