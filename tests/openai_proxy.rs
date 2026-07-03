@@ -480,6 +480,11 @@ async fn openai_client_health_probe_uses_internal_health_endpoint() {
     .await
     .unwrap();
 
+    assert!(
+        !client.endpoint_id_string().is_empty(),
+        "OpenAI client should expose its iroh endpoint ID for allow-peer configuration"
+    );
+
     openai_health_check_for_test(&client).await.unwrap();
     assert!(
         timeout(Duration::from_millis(100), contact_rx)

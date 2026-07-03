@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::*;
 use predicates::str::contains;
 
 #[test]
@@ -108,7 +109,10 @@ fn openai_client_help_lists_resource_limit_flags() {
         .stdout(contains("tunnel-operation-timeout-ms"))
         .stdout(contains("connect-timeout-ms"))
         .stdout(contains("reconnect-attempts"))
-        .stdout(contains("health-check-interval-ms"));
+        .stdout(contains("health-check-interval-ms"))
+        .stdout(contains("identity-path"))
+        .stdout(contains("./openai-server.key").not())
+        .stdout(contains("client endpoint IDs"));
 }
 
 #[test]

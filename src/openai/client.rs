@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use iroh::Endpoint;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::cli::OpenAiClientArgs;
-use crate::iroh_endpoint::{parse_server_ticket, start_client_endpoint};
+use crate::iroh_endpoint::{parse_server_ticket, start_client_endpoint_with_optional_identity};
 
 use super::{
     OpenAiClientConfig, OpenAiConnectionManager, openai_client_accept_loop,
@@ -24,6 +25,10 @@ pub struct OpenAiClientHandle {
 }
 
 impl OpenAiClientHandle {
+    pub fn endpoint_id_string(&self) -> String {
+        self.endpoint.id().to_string()
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         if let Some(health_task) = self.health_task {
             health_task.abort();
@@ -44,12 +49,18 @@ pub async fn run_client(args: OpenAiClientArgs) -> Result<()> {
         health_check_interval: args.health_check_interval_ms,
         max_concurrent_sessions: args.max_concurrent_sessions,
     };
-    let handle =
-        start_openai_client_for_test_with_config(args.server_ticket, args.listen, config).await?;
+    let handle = start_openai_client_with_optional_identity(
+        args.server_ticket,
+        args.listen,
+        config,
+        args.identity_path.as_deref(),
+    )
+    .await?;
     println!(
         "local OpenAI-compatible API listening on {}",
         handle.listen_addr
     );
+    println!("OpenAI client endpoint ID: {}", handle.endpoint_id_string());
     tokio::signal::ctrl_c().await.context("wait for ctrl-c")?;
     handle.shutdown().await
 }
@@ -74,9 +85,18 @@ pub async fn start_openai_client_for_test_with_config(
     listen: SocketAddr,
     config: OpenAiClientConfig,
 ) -> Result<OpenAiClientHandle> {
+    start_openai_client_with_optional_identity(server_ticket, listen, config, None).await
+}
+
+async fn start_openai_client_with_optional_identity(
+    server_ticket: String,
+    listen: SocketAddr,
+    config: OpenAiClientConfig,
+    identity_path: Option<&Path>,
+) -> Result<OpenAiClientHandle> {
     validate_client_config(&config)?;
     let server_addr = parse_server_ticket(&server_ticket)?;
-    let endpoint = start_client_endpoint().await?;
+    let endpoint = start_client_endpoint_with_optional_identity(identity_path).await?;
     let manager = Arc::new(
         OpenAiConnectionManager::connect(endpoint.clone(), server_addr, config.connect_timeout)
             .await?,

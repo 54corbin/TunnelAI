@@ -151,9 +151,19 @@ fn decode_hex_nibble(byte: u8) -> Result<u8> {
 }
 
 pub async fn start_client_endpoint() -> Result<Endpoint> {
-    Endpoint::bind(presets::N0)
-        .await
-        .context("bind iroh client endpoint")
+    start_client_endpoint_with_optional_identity(None).await
+}
+
+pub async fn start_client_endpoint_with_optional_identity(
+    identity_path: Option<&Path>,
+) -> Result<Endpoint> {
+    let mut builder = Endpoint::builder(presets::N0);
+
+    if let Some(path) = identity_path {
+        builder = builder.secret_key(load_or_create_secret_key(path)?);
+    }
+
+    builder.bind().await.context("bind iroh client endpoint")
 }
 
 pub async fn endpoint_ticket_string(endpoint: &Endpoint) -> Result<String> {

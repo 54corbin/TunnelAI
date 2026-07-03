@@ -1,6 +1,6 @@
 use tunnel_ai::iroh_endpoint::{
-    endpoint_ticket_string, parse_server_ticket, start_server_endpoint,
-    start_server_endpoint_with_optional_identity,
+    endpoint_ticket_string, parse_server_ticket, start_client_endpoint_with_optional_identity,
+    start_server_endpoint, start_server_endpoint_with_optional_identity,
 };
 
 #[test]
@@ -53,6 +53,26 @@ async fn persistent_server_identity_creates_missing_parent_directory() {
     endpoint.close().await;
 
     assert!(identity_path.exists());
+}
+
+#[tokio::test]
+async fn persistent_client_identity_reuses_endpoint_id() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let identity_path = temp_dir.path().join("openai-server.key");
+
+    let first = start_client_endpoint_with_optional_identity(Some(&identity_path))
+        .await
+        .unwrap();
+    let first_id = first.id();
+    first.close().await;
+
+    let second = start_client_endpoint_with_optional_identity(Some(&identity_path))
+        .await
+        .unwrap();
+    let second_id = second.id();
+    second.close().await;
+
+    assert_eq!(first_id, second_id);
 }
 
 #[tokio::test]

@@ -146,4 +146,8 @@ pub struct OpenAiClientArgs {
     /// Optional interval for background OpenAI proxy tunnel health checks, in milliseconds.
     #[arg(long, value_parser = duration_millis)]
     pub health_check_interval_ms: Option<Duration>,
+
+    /// Path to a persistent iroh identity secret for stable client endpoint IDs across restarts.
+    #[arg(long)]
+    pub identity_path: Option<PathBuf>,
 }

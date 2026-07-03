@@ -45,6 +45,14 @@ cargo check
 cargo test --workspace
 ```
 
+If you have `just` installed, common development and startup commands are also available:
+
+```bash
+just --list
+just build
+just test
+```
+
 ## Quick start: share an LLM API across your WLAN
 
 ### 1. Start your OpenAI-compatible provider
@@ -70,8 +78,20 @@ On the same machine as the provider:
 ```bash
 RUST_LOG=info target/release/tunnelAI openai-server \
   --provider-base-url http://127.0.0.1:8081/v1 \
-  --identity-path ~/.config/tunnelAI/openai-server.key \
+  --identity-path ./openai-server.key \
   --bind-addr 0.0.0.0:17777
+```
+
+Or with the included justfile:
+
+```bash
+just server http://127.0.0.1:8081/v1
+```
+
+This defaults to `0.0.0.0:17777` and `./openai-server.key`. Override them when needed:
+
+```bash
+just server http://127.0.0.1:8081/v1 0.0.0.0:17777 /path/to/openai-server.key
 ```
 
 The server prints:
@@ -92,6 +112,26 @@ On each laptop, workstation, or other machine on the same WLAN that should use t
 RUST_LOG=info target/release/tunnelAI openai-client \
   --server-ticket '<PASTE_SERVER_TICKET>' \
   --listen 127.0.0.1:8080
+```
+
+Or with the included justfile:
+
+```bash
+just client '<PASTE_SERVER_TICKET>'
+```
+
+The first argument is the endpoint ticket printed by `openai-server`; it is not the key file path. The client identity path is optional and defaults to an ephemeral identity. If you need a stable client endpoint ID for server-side `--allow-peer` rules, pass an identity path explicitly as the third argument:
+
+```bash
+just client '<PASTE_SERVER_TICKET>' 127.0.0.1:8080 ./openai-client.key
+```
+
+On startup, the client prints its iroh endpoint ID; use that value for server-side `--allow-peer` rules.
+
+To listen somewhere else:
+
+```bash
+just client '<PASTE_SERVER_TICKET>' 0.0.0.0:8080
 ```
 
 Point tools at:
@@ -127,6 +167,32 @@ If your upstream provider requires authentication, add its expected `Authorizati
 
 If your provider supports streaming, streaming responses pass back through the tunnel.
 
+## Generic SOCKS5 tunnel quick start
+
+For generic TCP traffic, start a SOCKS5 exit server:
+
+```bash
+just socks-server
+```
+
+If the server should allow connections to private, loopback, or link-local target addresses:
+
+```bash
+just socks-server 0.0.0.0:0 true
+```
+
+Then start a local SOCKS5 client with the printed server ticket:
+
+```bash
+just socks-client '<PASTE_SERVER_TICKET>'
+```
+
+The SOCKS client listens on `127.0.0.1:1080` by default. Override the listen address when needed:
+
+```bash
+just socks-client '<PASTE_SERVER_TICKET>' 127.0.0.1:1081
+```
+
 ## Recommended WAN setup
 
 After the WLAN path is working, you can keep the same server and extend it to remote networks.
@@ -135,11 +201,11 @@ For a personal or team deployment:
 
 1. Run the model/provider and `openai-server` on the GPU box or trusted gateway machine.
 2. Keep the provider bound to localhost when possible.
-3. Use `--identity-path ~/.config/tunnelAI/openai-server.key` so the server keeps the same iroh identity across restarts.
+3. Use `--identity-path ./openai-server.key` so the server keeps the same iroh identity across restarts.
 4. Use `--bind-addr 0.0.0.0:17777` so the ticket can include a stable direct address when the network allows it.
 5. Run `openai-client` on each remote machine with `--listen 127.0.0.1:8080`.
 6. Set each app's `OPENAI_BASE_URL` to `http://127.0.0.1:8080/v1`.
-7. Add `--allow-peer <CLIENT_ENDPOINT_ID>` on the server for machines you trust.
+7. Add `--allow-peer <CLIENT_ENDPOINT_ID>` on the server for machines you trust. If that rule must survive client restarts, run `openai-client` with an explicit `--identity-path`; the client prints its endpoint ID when it starts.
 8. Use host firewall rules when the server is on a public or semi-public network.
 
 Iroh handles peer connection setup and NAT traversal. A fixed server UDP port improves repeatability, but the first usable version does not require you to design a public HTTP service.
@@ -178,7 +244,7 @@ Server flags:
 tunnelAI openai-server \
   --provider-base-url <URL> \
   --bind-addr 0.0.0.0:17777 \
-  --identity-path ~/.config/tunnelAI/openai-server.key \
+  --identity-path ./openai-server.key \
   --allow-peer <CLIENT_ENDPOINT_ID> \
   --max-connections 128 \
   --max-streams-per-connection 128 \
@@ -201,7 +267,7 @@ tunnelAI openai-client \
   --health-check-interval-ms 30000
 ```
 
-`--health-check-interval-ms` is optional. The health check calls the server's internal `/__tunnelAI/healthz` endpoint over the tunnel and does not reach the configured provider.
+`--identity-path` and `--health-check-interval-ms` are optional. Without `--identity-path`, the client uses an ephemeral iroh identity for that run. The health check calls the server's internal `/__tunnelAI/healthz` endpoint over the tunnel and does not reach the configured provider.
 
 ## Provider URL behavior
 
@@ -229,6 +295,7 @@ The proxy accepts origin-form HTTP request targets such as `/v1/chat/completions
 
 - Treat server tickets like bearer connection details. Anyone with a reusable ticket can try to dial the server.
 - Use `openai-server --allow-peer <CLIENT_ENDPOINT_ID>` for WAN use. Without it, any peer with the ticket can try to connect.
+- `openai-client --identity-path` is optional. Use it only when the client needs a stable endpoint ID, for example with server-side `--allow-peer` rules that must survive client restarts.
 - Keep `openai-client --listen` on `127.0.0.1` unless you intend to expose the local API port to nearby machines.
 - `openai-client` does not implement HTTP authentication.
 - Provider credentials pass through request headers from the local app to the configured provider.
