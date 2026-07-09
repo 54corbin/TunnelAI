@@ -30,7 +30,7 @@ client server_ticket listen="127.0.0.1:8080" identity_path="":
 openai-server provider_base_url="http://127.0.0.1:20128/v1" bind_addr="0.0.0.0:17777" identity_path="./openai-server.key":
     #!/usr/bin/env bash
     set -euo pipefail
-    RUST_LOG="${RUST_LOG:-info}" cargo run --release -- openai-server \
+    cargo run --release -- openai-server \
       --provider-base-url {{quote(provider_base_url)}} \
       --bind-addr {{quote(bind_addr)}} \
       --identity-path {{quote(identity_path)}}
